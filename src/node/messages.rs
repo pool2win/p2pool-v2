@@ -15,7 +15,7 @@
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::shares::miner_message::{MinerWorkbase, UserWorkbase};
-use crate::shares::ShareBlock;
+use crate::shares::{ShareBlock, ShareHeader};
 use bitcoin::{BlockHash, Txid};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -27,11 +27,16 @@ use std::error::Error;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
     Inventory(InventoryMessage),
-    GetData(GetData),
+    NotFound(()),
+    GetShareHeaders(Vec<BlockHash>, BlockHash),
+    GetShareBlocks(Vec<BlockHash>, BlockHash),
+    ShareHeaders(Vec<ShareHeader>),
     ShareBlock(ShareBlock),
+    GetData(GetData),
     Workbase(MinerWorkbase),
     UserWorkbase(UserWorkbase),
     Transaction(bitcoin::Transaction),
+    MiningShare(ShareBlock),
 }
 
 impl Message {
@@ -53,16 +58,18 @@ impl Message {
     }
 }
 
-/// Message for sending a list of shares to the network
+/// The inventory message used to tell a peer what we have in our inventory.
+/// The message can be used to tell the peer about share headers, blocks, or transactions that this peer has.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct InventoryMessage {
-    pub have_shares: HashSet<BlockHash>,
+pub enum InventoryMessage {
+    BlockHashes(Vec<BlockHash>),
+    TransactionHashes(Vec<Txid>),
 }
 
 /// Message for requesting data from peers
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum GetData {
-    BlockHash(BlockHash),
+    Block(BlockHash),
     Txid(Txid),
 }
 
@@ -73,21 +80,21 @@ mod tests {
 
     #[test]
     fn test_inventory_message_serde() {
-        let mut have_shares = HashSet::new();
-        have_shares.insert(
+        let mut have_shares = Vec::new();
+        have_shares.push(
             BlockHash::from_str("0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb5")
                 .unwrap(),
         );
-        have_shares.insert(
+        have_shares.push(
             BlockHash::from_str("0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb6")
                 .unwrap(),
         );
-        have_shares.insert(
+        have_shares.push(
             BlockHash::from_str("0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb7")
                 .unwrap(),
         );
 
-        let msg = Message::Inventory(InventoryMessage { have_shares });
+        let msg = Message::Inventory(InventoryMessage::BlockHashes(have_shares));
 
         // Test serialization
         let serialized = msg.cbor_serialize().unwrap();
@@ -96,25 +103,25 @@ mod tests {
         let deserialized = Message::cbor_deserialize(&serialized).unwrap();
 
         let deserialized = match deserialized {
-            Message::Inventory(inventory) => inventory,
+            Message::Inventory(InventoryMessage::BlockHashes(have_shares)) => have_shares,
             _ => panic!("Expected Inventory variant"),
         };
 
         // Verify the deserialized message matches original
-        assert_eq!(deserialized.have_shares.len(), 3);
-        assert!(deserialized.have_shares.contains(
+        assert_eq!(deserialized.len(), 3);
+        assert!(deserialized.contains(
             &BlockHash::from_str(
                 "0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb5"
             )
             .unwrap()
         ));
-        assert!(deserialized.have_shares.contains(
+        assert!(deserialized.contains(
             &BlockHash::from_str(
                 "0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb6"
             )
             .unwrap()
         ));
-        assert!(deserialized.have_shares.contains(
+        assert!(deserialized.contains(
             &BlockHash::from_str(
                 "0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb7"
             )
@@ -125,14 +132,14 @@ mod tests {
     #[test]
     fn test_get_data_message_serde() {
         // Test BlockHash variant
-        let block_msg = Message::GetData(GetData::BlockHash(
+        let block_msg = Message::GetData(GetData::Block(
             BlockHash::from_str("0000000086704a35f17580d06f76d4c02d2b1f68774800675fb45f0411205bb5")
                 .unwrap(),
         ));
         let serialized = block_msg.cbor_serialize().unwrap();
         let deserialized = Message::cbor_deserialize(&serialized).unwrap();
         match deserialized {
-            Message::GetData(GetData::BlockHash(hash)) => {
+            Message::GetData(GetData::Block(hash)) => {
                 assert_eq!(
                     hash,
                     BlockHash::from_str(
