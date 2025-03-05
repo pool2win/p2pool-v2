@@ -42,7 +42,7 @@ pub async fn handle_mining_message(
             let mut share_block =
                 ShareBlock::new(share, miner_pubkey, bitcoin::Network::Regtest, &mut vec![]);
             share_block = chain_handle.setup_share_for_chain(share_block).await;
-            message = Message::ShareBlock(share_block.clone());
+            message = Message::MiningShare(share_block.clone());
             if let Err(e) = chain_handle.add_share(share_block).await {
                 error!("Failed to add share: {}", e);
                 return Err("Error adding share to chain".into());
@@ -64,8 +64,7 @@ pub async fn handle_mining_message(
         }
     };
 
-    let serialized_message = message.cbor_serialize().unwrap();
-    if let Err(e) = swarm_tx.send(SwarmSend::Gossip(serialized_message)).await {
+    if let Err(e) = swarm_tx.send(SwarmSend::Gossip(message)).await {
         error!("Failed to send share: {}", e);
         return Err("Error sending share to network".into());
     }

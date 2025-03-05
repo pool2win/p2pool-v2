@@ -19,6 +19,7 @@ pub mod request_response_handler;
 pub use crate::config::Config;
 pub mod actor;
 pub mod messages;
+pub mod p2p_message_handlers;
 
 use crate::node::messages::{InventoryMessage, Message};
 #[mockall_double::double]
@@ -27,6 +28,7 @@ use crate::shares::receive_mining_message::start_receiving_mining_messages;
 use behaviour::{P2PoolBehaviour, P2PoolBehaviourEvent};
 use libp2p::identify;
 use libp2p::mdns::Event as MdnsEvent;
+use libp2p::request_response::ResponseChannel;
 use libp2p::PeerId;
 use libp2p::{
     gossipsub,
@@ -43,8 +45,9 @@ use tracing::{debug, error, info};
 /// Capture send type for swarm p2p messages that can be sent to the swarm
 #[allow(dead_code)]
 pub enum SwarmSend {
-    Gossip(Vec<u8>),
-    Message(PeerId, Message),
+    Gossip(Message),
+    Request(PeerId, Message),
+    Response(ResponseChannel<Message>, Message),
 }
 
 /// Node is the main struct that represents the node
@@ -132,20 +135,6 @@ impl Node {
     pub fn shutdown(&mut self) -> Result<(), Box<dyn Error>> {
         for peer_id in self.swarm.connected_peers().cloned().collect::<Vec<_>>() {
             self.swarm.disconnect_peer_id(peer_id).unwrap_or_default();
-        }
-        Ok(())
-    }
-
-    /// Send a share to the network
-    pub fn send_gossip(&mut self, buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
-        if let Err(e) = self
-            .swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(self.share_topic.clone(), buf)
-        {
-            error!("Failed to send share: {}", e);
-            return Err("Error sending share to network".into());
         }
         Ok(())
     }
@@ -308,15 +297,16 @@ impl Node {
     /// Handle connection established events, these are events that are generated when a connection is established
     async fn handle_connection_established(&mut self, peer_id: libp2p::PeerId) {
         info!("Connection established with peer: {peer_id}");
-        let _ = self.send_inventory(peer_id).await;
+        let _ = self.send_header_inventory(peer_id).await;
     }
 
     /// Send inventory message to a specific peer
     /// For now we just send the tip of the chain
-    async fn send_inventory(&mut self, peer_id: libp2p::PeerId) {
+    async fn send_header_inventory(&mut self, peer_id: libp2p::PeerId) {
         let tips = self.chain_handle.get_tips().await;
         info!("Sending inventory message to peer: {peer_id}, tips: {tips:?}");
-        let inventory_msg = Message::Inventory(InventoryMessage { have_shares: tips });
+        let inventory_msg =
+            Message::Inventory(InventoryMessage::BlockHashes(tips.into_iter().collect()));
         if let Err(e) = self.send_to_peer(peer_id, inventory_msg) {
             error!(
                 "Failed to send inventory message to peer {}: {}",
