@@ -110,7 +110,7 @@ mod tests {
         let mut mock_chain = ChainHandle::default();
 
         let json_str = include_str!("../../tests/test_data/simple_miner_workbase.json");
-        let workbase: MinerWorkbase = serde_json::from_str(&json_str).unwrap();
+        let workbase: MinerWorkbase = serde_json::from_str(json_str).unwrap();
 
         mock_chain
             .expect_add_workbase()
@@ -140,7 +140,7 @@ mod tests {
         let mut mock_chain = ChainHandle::default();
 
         let json_str = include_str!("../../tests/test_data/simple_miner_workbase.json");
-        let workbase: MinerWorkbase = serde_json::from_str(&json_str).unwrap();
+        let workbase: MinerWorkbase = serde_json::from_str(json_str).unwrap();
 
         mock_chain
             .expect_add_workbase()
@@ -174,7 +174,7 @@ mod tests {
         let mut mock_chain = ChainHandle::default();
 
         let json_str = include_str!("../../tests/test_data/simple_miner_workbase.json");
-        let workbase: MinerWorkbase = serde_json::from_str(&json_str).unwrap();
+        let workbase: MinerWorkbase = serde_json::from_str(json_str).unwrap();
 
         mock_chain
             .expect_add_workbase()
@@ -192,7 +192,7 @@ mod tests {
         let mut mock_chain = ChainHandle::default();
 
         let json_str = include_str!("../../tests/test_data/simple_miner_workbase.json");
-        let workbase: MinerWorkbase = serde_json::from_str(&json_str).unwrap();
+        let workbase: MinerWorkbase = serde_json::from_str(json_str).unwrap();
 
         mock_chain
             .expect_add_workbase()
@@ -211,7 +211,7 @@ mod tests {
         let mut mock_chain = ChainHandle::default();
 
         let json_str = include_str!("../../tests/test_data/validation/userworkbases.json");
-        let userworkbases: Vec<CkPoolMessage> = serde_json::from_str(&json_str).unwrap();
+        let userworkbases: Vec<CkPoolMessage> = serde_json::from_str(json_str).unwrap();
         let user_workbases = userworkbases
             .into_iter()
             .filter_map(|msg| match msg {
@@ -241,7 +241,7 @@ mod tests {
         let mut mock_chain = ChainHandle::default();
 
         let json_str = include_str!("../../tests/test_data/validation/userworkbases.json");
-        let userworkbases: Vec<CkPoolMessage> = serde_json::from_str(&json_str).unwrap();
+        let userworkbases: Vec<CkPoolMessage> = serde_json::from_str(json_str).unwrap();
         let user_workbases = userworkbases
             .into_iter()
             .filter_map(|msg| match msg {
