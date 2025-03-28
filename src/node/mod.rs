@@ -21,9 +21,11 @@ pub mod actor;
 pub mod gossip_handler;
 pub mod messages;
 pub mod p2p_message_handlers;
+pub mod rate_limiter;
 
+use crate::node::behaviour::request_response::RequestResponseEvent;
 use crate::node::messages::Message;
-use crate::node::p2p_message_handlers::senders::send_getheaders;
+use crate::node::p2p_message_handlers::senders::{send_blocks_inventory, send_getheaders};
 #[mockall_double::double]
 use crate::shares::chain::actor::ChainHandle;
 use crate::shares::receive_mining_message::start_receiving_mining_messages;
@@ -39,11 +41,12 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, Swarm,
 };
+use rate_limiter::RateLimiter;
 use request_response_handler::handle_request_response_event;
 use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct SwarmResponseChannel<T> {
     channel: ResponseChannel<T>,
@@ -79,6 +82,8 @@ struct Node {
     swarm_rx: mpsc::Receiver<SwarmSend<ResponseChannel<Message>>>,
     share_topic: gossipsub::IdentTopic,
     chain_handle: ChainHandle,
+    rate_limiter: RateLimiter,
+    config: Config,
 }
 
 impl Node {
@@ -166,12 +171,17 @@ impl Node {
             return Err(e);
         }
 
+        let rate_limiter =
+            RateLimiter::new(Duration::from_secs(config.network.rate_limit_window_secs));
+
         Ok(Self {
             swarm,
             swarm_tx,
             swarm_rx,
             share_topic,
             chain_handle,
+            rate_limiter,
+            config: config.clone(),
         })
     }
 
@@ -266,29 +276,11 @@ impl Node {
                     Ok(())
                 }
                 P2PoolBehaviourEvent::Gossipsub(gossip_event) => {
-                    let chain_handle = self.chain_handle.clone();
-                    tokio::spawn(async move {
-                        let result = handle_gossipsub_event(gossip_event, chain_handle).await;
-                        if let Err(e) = result {
-                            error!("Failed to handle gossipsub event: {}", e);
-                        }
-                    });
-                    Ok(())
+                    self.handle_gossipsub_event(gossip_event).await
                 }
                 P2PoolBehaviourEvent::RequestResponse(request_response_event) => {
-                    let chain_handle = self.chain_handle.clone();
-                    let swarm_tx = self.swarm_tx.clone();
-                    // TODO: Limit the number of concurrent requests
-                    tokio::spawn(async move {
-                        handle_request_response_event(
-                            request_response_event,
-                            chain_handle,
-                            swarm_tx,
-                        )
+                    self.handle_request_response_event(request_response_event)
                         .await
-                        .unwrap();
-                    });
-                    Ok(())
                 }
             },
             _ => Ok(()),
@@ -362,5 +354,115 @@ impl Node {
             },
             _ => debug!("Other Kademlia event: {:?}", event),
         }
+    }
+
+    /// Handle connection established events, these are events that are generated when a connection is established
+    async fn handle_connection_established(&mut self, peer_id: libp2p::PeerId) {
+        info!("Connection established with peer: {peer_id}");
+        let _ = send_blocks_inventory::<ResponseChannel<Message>>(
+            peer_id,
+            self.chain_handle.clone(),
+            self.swarm_tx.clone(),
+        )
+        .await;
+    }
+
+    /// Handle gossipsub events from the libp2p network
+    async fn handle_gossipsub_event(
+        &mut self,
+        gossip_event: gossipsub::Event,
+    ) -> Result<(), Box<dyn Error>> {
+        if let gossipsub::Event::Message {
+            propagation_source,
+            message_id: _,
+            message,
+        } = &gossip_event
+        {
+            match Message::cbor_deserialize(&message.data) {
+                Ok(deserialized_msg) => {
+                    let message_type = Message::from(deserialized_msg);
+                    if !self
+                        .rate_limiter
+                        .check_rate_limit(
+                            &propagation_source,
+                            message_type.clone(),
+                            &self.config.network,
+                        )
+                        .await
+                    {
+                        warn!(
+                        "Rate limit exceeded for peer {} with message type {:?}. Disconnecting.",
+                        propagation_source, message_type
+                    );
+                        self.swarm
+                            .disconnect_peer_id(*propagation_source)
+                            .unwrap_or_else(|e| {
+                                error!("Failed to disconnect rate-limited peer: {:?}", e);
+                            });
+                        return Ok(());
+                    }
+
+                    let chain_handle = self.chain_handle.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_gossipsub_event(gossip_event, chain_handle).await {
+                            error!("Failed to handle gossipsub event: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to deserialize gossip message from {}: {}",
+                        propagation_source, e
+                    );
+                    return Err("Failed to deserialize message".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle request-response events from the libp2p network
+    async fn handle_request_response_event(
+        &mut self,
+        request_response_event: RequestResponseEvent<Message, Message>,
+    ) -> Result<(), Box<dyn Error>> {
+        if let RequestResponseEvent::Message {
+            peer,
+            message:
+                libp2p::request_response::Message::Request {
+                    request_id: _,
+                    request,
+                    channel: _,
+                },
+        } = &request_response_event
+        {
+            let message = Message::from(request.clone());
+            if !self
+                .rate_limiter
+                .check_rate_limit(&peer, message.clone(), &self.config.network)
+                .await
+            {
+                warn!(
+                    "Rate limit exceeded for peer {} with message type {:?}. Disconnecting.",
+                    peer, message
+                );
+                self.swarm.disconnect_peer_id(*peer).unwrap_or_else(|e| {
+                    error!("Failed to disconnect rate-limited peer: {:?}", e);
+                });
+                return Ok(());
+            }
+
+            let chain_handle = self.chain_handle.clone();
+            let swarm_tx = self.swarm_tx.clone();
+            let event_clone = request_response_event;
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_request_response_event(event_clone, chain_handle, swarm_tx).await
+                {
+                    error!("Failed to handle request-response event: {}", e);
+                }
+            });
+        }
+        Ok(())
     }
 }
