@@ -44,9 +44,10 @@ use libp2p::{
 use rate_limiter::RateLimiter;
 use request_response_handler::handle_request_response_event;
 use std::error::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+use std::sync::{Arc, Mutex};
 
 pub struct SwarmResponseChannel<T> {
     channel: ResponseChannel<T>,
@@ -73,6 +74,7 @@ pub enum SwarmSend<C> {
     Gossip(Message),
     Request(PeerId, Message),
     Response(C, Message),
+    Disconnect(PeerId),
 }
 
 /// Node is the main struct that represents the node
@@ -84,6 +86,7 @@ struct Node {
     chain_handle: ChainHandle,
     rate_limiter: RateLimiter,
     config: Config,
+    last_share_time: Arc<Mutex<HashMap<PeerId, Instant>>>,
 }
 
 impl Node {
@@ -174,6 +177,21 @@ impl Node {
         let rate_limiter =
             RateLimiter::new(Duration::from_secs(config.network.rate_limit_window_secs));
 
+        let last_share_clone = last_share_time.clone();
+        let swarm_tx_clone = swarm_tx.clone();
+        let inactivity_timeout = config.network.inactive_peer_timeout;
+        
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(86400)).await;
+                Self::cleanup_inactive_peers(
+                    last_share_time.clone(),
+                    swarm_tx.clone(),
+                    Duration::from_secs(config.network.inactive_peer_timeout_secs)
+                ).await;
+            }
+        });    
+
         Ok(Self {
             swarm,
             swarm_tx,
@@ -182,6 +200,7 @@ impl Node {
             chain_handle,
             rate_limiter,
             config: config.clone(),
+            last_share_time: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -283,6 +302,13 @@ impl Node {
                         .await
                 }
             },
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                info!("Disconnected from peer: {peer_id}");
+                self.swarm.behaviour_mut().remove_peer(&peer_id);
+                let mut times = self.last_share_time.lock().unwrap();
+                times.remove(&peer_id);
+                Ok(())
+            },
             _ => Ok(()),
         }
     }
@@ -367,6 +393,23 @@ impl Node {
         .await;
     }
 
+    async fn cleanup_inactive_peers(
+        last_share_times: Arc<Mutex<HashMap<PeerId, Instant>>>,
+        swarm_tx: mpsc::Sender<SwarmSend<()>>,
+        timeout: Duration
+    ) {
+        let inactive_peers = {
+            let mut last_share_received_times = last_share_times.lock().unwrap();
+            last_share_received_times.extract_if(|_, last_seen| {
+                Instant::now().duration_since(*last_seen) > timeout
+            }).map(|(peer_id, _)| peer_id).collect::<Vec<_>>()
+        };
+
+        for peer_id in inactive_peers {
+            let _ = swarm_tx.send(SwarmSend::Disconnect(peer_id)).await;
+        }
+    }
+
     /// Handle gossipsub events from the libp2p network
     async fn handle_gossipsub_event(
         &mut self,
@@ -380,6 +423,10 @@ impl Node {
         {
             match Message::cbor_deserialize(&message.data) {
                 Ok(deserialized_msg) => {
+                    if let Message::MiningShare(_) = deserialized_msg {
+                        let mut times = self.last_share_times.lock().unwrap();
+                        times.insert(*propagation_source, Instant::now());
+                    }
                     let message_type = Message::from(deserialized_msg);
                     if !self
                         .rate_limiter
