@@ -20,7 +20,7 @@ use crate::shares::validation;
 use crate::shares::ShareBlock;
 use crate::utils::time_provider::TimeProvider;
 use std::error::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Handle a ShareBlock received from a peer
 /// This is called on receiving a ShareBlock from the gossipsub protocol,
@@ -36,8 +36,8 @@ pub async fn handle_share_block(
 ) -> Result<(), Box<dyn Error>> {
     info!("Received share block: {:?}", share_block);
     if let Err(e) = validation::validate(&share_block, &chain_handle, time_provider).await {
-        error!("Share block validation failed: {}", e);
-        return Err("Share block validation failed".into());
+        warn!("Invalid share block from peer: {}", e);
+        return Err(e.into());
     }
     if let Err(e) = chain_handle.add_share(share_block.clone()).await {
         error!("Failed to add share: {}", e);
@@ -175,5 +175,34 @@ mod tests {
             result.unwrap_err().to_string(),
             "Error adding share to chain"
         );
+
+        // Test invalid share handling
+        let mut received_commands = Vec::new();
+
+        let invalid_share = crate::test_utils::TestBlockBuilder::new()
+            .blockhash("0000000000000000000000000000000000000000000000000000000000000000")
+            .workinfoid(7473434392883363843)
+            .build();
+
+        let response = handle_request(
+            peer_id,
+            Message::ShareBlock(invalid_share),
+            chain_handle.clone(),
+            response_channel_tx.clone(),
+            swarm_tx.clone(),
+            &time_provider,
+        )
+        .await;
+
+        assert!(
+            response.is_err(),
+            "Invalid share should result in error"
+        );
+
+        // Verify disconnect command was sent
+        if let Ok(cmd) = swarm_rx.try_recv() {
+            received_commands.push(cmd);
+        }
+        assert!(received_commands.iter().any(|cmd| matches!(cmd, SwarmSend::DisconnectPeer(p) if *p == peer_id)));
     }
 }
