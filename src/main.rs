@@ -32,11 +32,12 @@ mod utils;
 use crate::node::actor::NodeHandle;
 #[mockall_double::double]
 use crate::shares::chain::actor::ChainHandle;
-use bitcoin::PublicKey;
 use tracing::error;
 
 #[cfg(test)]
 mod test_utils;
+
+mod stratum;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -68,6 +69,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let tip = chain_handle.get_chain_tip().await;
     let height = chain_handle.get_tip_height().await;
     info!("Latest tip {} at height {}", tip.unwrap(), height.unwrap());
+
+    let stratum_config = config.stratum.clone();
+    tokio::spawn(async move {
+        let stratum_server =
+            stratum::server::StratumServer::new(stratum_config.port, stratum_config.host);
+        info!("Starting Stratum server...");
+        let result = stratum_server.start().await;
+        if result.is_err() {
+            error!("Failed to start Stratum server: {}", result.unwrap_err());
+        }
+        info!("Stratum server stopped");
+    });
+
     if let Ok((_node_handle, stopping_rx)) = NodeHandle::new(config, chain_handle).await {
         info!("Node started");
         stopping_rx.await?;

@@ -14,13 +14,21 @@
 // You should have received a copy of the GNU General Public License along with
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod bitcoind_rpc;
-pub mod command;
-pub mod config;
-pub mod node;
-pub mod shares;
-pub mod stratum;
-pub mod utils;
+use crate::stratum::error::Error;
+use crate::stratum::messages::{Request, Response};
+use crate::stratum::session::Session;
+use serde_json::json;
+use tracing::debug;
 
-#[cfg(test)]
-pub mod test_utils;
+/// Handle the "mining.submit" message
+/// This function is called when a miner submits a share to the Stratum server.
+/// It sends a response with the submission status.
+/// The function accepts a mutable reference to a `Session` object, which informs the responses.
+/// The session is also updated in response to received messages, if required.
+pub async fn handle_submit<'a>(
+    message: Request<'a>,
+    session: &mut Session,
+) -> Result<Response<'a>, Error> {
+    debug!("Handling mining.submit message");
+    Ok(Response::new_ok(message.id, json!(true)))
+}
