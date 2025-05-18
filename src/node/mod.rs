@@ -22,10 +22,14 @@ pub mod gossip_handler;
 pub mod messages;
 pub mod p2p_message_handlers;
 pub mod rate_limiter;
+pub use crate::node::p2p_message_handlers::server::P2PoolService;
+use tower::Service;
 
 use crate::node::behaviour::request_response::RequestResponseEvent;
 use crate::node::messages::Message;
 use crate::node::p2p_message_handlers::senders::{send_blocks_inventory, send_getheaders};
+use crate::node::p2p_message_handlers::server::RequestContext;
+use crate::node::p2p_message_handlers::RequestHandlerError;
 #[mockall_double::double]
 use crate::shares::chain::actor::ChainHandle;
 use crate::shares::receive_mining_message::start_receiving_mining_messages;
@@ -43,7 +47,6 @@ use libp2p::{
     Multiaddr, Swarm,
 };
 use rate_limiter::RateLimiter;
-use request_response_handler::handle_request_response_event;
 use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -86,6 +89,7 @@ struct Node {
     chain_handle: ChainHandle,
     rate_limiter: RateLimiter,
     config: Config,
+    p2p_service: P2PoolService,
 }
 
 impl Node {
@@ -176,6 +180,8 @@ impl Node {
         let rate_limiter =
             RateLimiter::new(Duration::from_secs(config.network.rate_limit_window_secs));
 
+        let p2p_service = P2PoolService::new();
+
         Ok(Self {
             swarm,
             swarm_tx,
@@ -184,6 +190,7 @@ impl Node {
             chain_handle,
             rate_limiter,
             config: config.clone(),
+            p2p_service,
         })
     }
 
@@ -434,36 +441,41 @@ impl Node {
                 libp2p::request_response::Message::Request {
                     request_id: _,
                     request,
-                    channel: _,
+                    channel,
                 },
-        } = &request_response_event
+        } = request_response_event
         {
             let message = request.clone();
             if !self
                 .rate_limiter
-                .check_rate_limit(peer, message.clone(), &self.config.network)
+                .check_rate_limit(&peer, message.clone(), &self.config.network)
                 .await
             {
                 warn!(
                     "Rate limit exceeded for peer {} with message type {:?}. Disconnecting.",
                     peer, message
                 );
-                self.swarm.disconnect_peer_id(*peer).unwrap_or_else(|e| {
+                self.swarm.disconnect_peer_id(peer).unwrap_or_else(|e| {
                     error!("Failed to disconnect rate-limited peer: {:?}", e);
                 });
                 return Ok(());
             }
 
-            let chain_handle = self.chain_handle.clone();
-            let swarm_tx = self.swarm_tx.clone();
-            let event_clone = request_response_event;
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_request_response_event(event_clone, chain_handle, swarm_tx).await
-                {
-                    error!("Failed to handle request-response event: {}", e);
-                }
-            });
+            // Prepare the request context for the Tower service
+            let request_context = RequestContext {
+                peer,
+                message: request.clone(),
+                channel,
+                chain_handle: self.chain_handle.clone(),
+                swarm_tx: self.swarm_tx.clone(),
+            };
+
+            // Call the P2PoolService
+            let mut service = self.p2p_service.clone();
+            if let Err(e) = service.call(request_context).await {
+                error!("Failed to handle request-response event: {}", e);
+                return Err(e);
+            }
         }
         Ok(())
     }
