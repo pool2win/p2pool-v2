@@ -1,6 +1,6 @@
 // Copyright (C) 2024, 2025 P2Poolv2 Developers (see AUTHORS)
 //
-//  This file is part of P2Poolv2
+// This file is part of P2Poolv2
 //
 // P2Poolv2 is free software: you can redistribute it and/or modify it under
 // the terms of the GNU General Public License as published by the Free
@@ -14,20 +14,4 @@
 // You should have received a copy of the GNU General Public License along with
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod info;
-
-// Re-export the shared store functionality
-pub mod store {
-    use crate::shares::store::Store;
-    use std::error::Error;
-
-    /// Open a store from the given path
-    pub fn open_store(store_path: String) -> Result<Store, Box<dyn Error>> {
-        tracing::info!("Opening store in read-only mode: {:?}", store_path);
-
-        Store::new(store_path, true).map_err(|e| {
-            tracing::error!("Failed to open store: {}", e);
-            e
-        })
-    }
-}
+pub mod validate;

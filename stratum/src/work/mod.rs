@@ -15,6 +15,8 @@
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod coinbase;
+pub mod difficulty;
 mod error;
 pub mod gbt;
 pub mod notify;
+pub mod tracker;

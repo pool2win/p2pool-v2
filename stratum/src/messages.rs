@@ -73,6 +73,9 @@ pub struct Error<'a> {
 
 /// Request represents a Stratum request message from client to the server
 /// The params in this message are all strings
+///
+/// We are not using enum to capture the different request types, as we want to remain flexible
+/// for handling the diverse Stratum client implementations out there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,6 +410,39 @@ mod tests {
         assert_eq!(
             serialized_message,
             r#"{"method":"mining.notify","params":["job_id","prevhash","coinbase1","coinbase2",["branch1","branch2"],"version","nbits","ntime",true]}"#
+        );
+
+        let message = serde_json::from_str::<Notify>(
+            r#"{"method":"mining.notify","params":["job_id","prevhash","coinbase1","coinbase2",["branch1","branch2"],"version","nbits","ntime",true]}"#,
+        );
+        assert!(message.is_ok());
+        assert_eq!(
+            message.unwrap().params.merkle_branches.len(),
+            2,
+            "Expected two merkle branches"
+        );
+
+        let message = serde_json::from_str::<Notify>(
+            r#"{"method":"mining.notify","params":["184678627bb03d4b","00000000044a23dd986cd2562a5bbad49b42e2dd5068adb4aa57e50bff8d2997","00000020010000000000000000000000000000000000000000000000000000000000000000ffffffff25029c0001000401f342680470a418280c","085032506f6f6c7632ffffffff0200f2052a01000000160014274466e754a1c12d0a2d2cc34ceb70d8e017053a0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf900000000",[],"20000000","1e0377ae","6842f301",true]}"#,
+        );
+        assert!(message.is_ok());
+        assert_eq!(
+            message.unwrap().params.merkle_branches.len(),
+            0,
+            "Expected empty merkle branches"
+        );
+
+        let notify_str = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tests/test_data/validation/stratum/a/notify.json"),
+        )
+        .unwrap();
+        let notify: Notify = serde_json::from_str(&notify_str).unwrap();
+        assert_eq!(notify.method, "mining.notify");
+        assert_eq!(
+            notify.params.merkle_branches.len(),
+            0,
+            "Expected empty merkle branches"
         );
     }
 

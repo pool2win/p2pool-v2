@@ -28,6 +28,7 @@ use std::str::FromStr;
 use stratum::client_connections::spawn;
 use stratum::server::StratumServer;
 use stratum::work::gbt::start_gbt;
+use stratum::work::tracker::start_tracker_actor;
 use tracing::error;
 use tracing::{debug, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
@@ -71,15 +72,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let stratum_config = config.stratum.clone();
     let bitcoin_config = config.bitcoin.clone();
+    let bitcoinrpc_config = config.bitcoinrpc.clone();
     let (stratum_shutdown_tx, stratum_shutdown_rx) = tokio::sync::oneshot::channel();
     let (notify_tx, notify_rx) = tokio::sync::mpsc::channel(1);
+    let tracker_handle = start_tracker_actor();
 
     let notify_tx_for_gbt = notify_tx.clone();
+    let bitcoinrpc_config_cloned = bitcoinrpc_config.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_gbt::<BitcoindRpcClient>(
-            bitcoin_config.url,
-            bitcoin_config.username,
-            bitcoin_config.password,
+        if let Err(e) = start_gbt(
+            &bitcoinrpc_config_cloned,
             notify_tx_for_gbt,
             SOCKET_PATH,
             GBT_POLL_INTERVAL,
@@ -100,11 +102,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .require_network(config.bitcoin.network)
         .expect("Output address must match the Bitcoin network in config");
 
+    let tracker_handle_cloned = tracker_handle.clone();
     tokio::spawn(async move {
         info!("Starting Stratum notifier...");
         // This will run indefinitely, sending new block templates to the Stratum server as they arrive
-        stratum::work::notify::start_notify(notify_rx, connections_cloned, Some(output_address))
-            .await;
+        stratum::work::notify::start_notify(
+            notify_rx,
+            connections_cloned,
+            Some(output_address),
+            tracker_handle_cloned,
+        )
+        .await;
     });
 
     tokio::spawn(async move {
@@ -116,7 +124,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await;
         info!("Starting Stratum server...");
-        let result = stratum_server.start(None, notify_tx).await;
+        let result = stratum_server
+            .start(None, notify_tx, tracker_handle, bitcoinrpc_config)
+            .await;
         if result.is_err() {
             error!("Failed to start Stratum server: {}", result.unwrap_err());
         }

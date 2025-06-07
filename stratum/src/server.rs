@@ -24,6 +24,8 @@ use crate::message_handlers::handle_message;
 use crate::messages::Request;
 use crate::session::Session;
 use crate::work::notify::NotifyCmd;
+use crate::work::tracker::TrackerHandle;
+use bitcoindrpc::BitcoinRpcConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -63,6 +65,8 @@ impl StratumServer {
         &mut self,
         ready_tx: Option<oneshot::Sender<()>>,
         notify_tx: mpsc::Sender<NotifyCmd>,
+        tracker_handle: TrackerHandle,
+        bitcoinrpc_config: BitcoinRpcConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send>> {
         info!("Starting Stratum server at {}:{}", self.hostname, self.port);
 
@@ -100,10 +104,12 @@ impl StratumServer {
                             let buf_reader = BufReader::new(reader);
 
                             let notify_tx_cloned = notify_tx.clone();
+                            let tracker_handle_cloned = tracker_handle.clone();
+                            let bitcoinrpc_config_cloned = bitcoinrpc_config.clone();
                             // Spawn a new task for each connection
                             tokio::spawn(async move {
                                 // Handle the connection with graceful shutdown support
-                                let _ = handle_connection(buf_reader, writer, addr, message_rx, shutdown_rx, notify_tx_cloned).await;
+                                let _ = handle_connection(buf_reader, writer, addr, message_rx, shutdown_rx, notify_tx_cloned, tracker_handle_cloned, bitcoinrpc_config_cloned).await;
                             });
                         }
                         Err(e) => {
@@ -130,6 +136,8 @@ async fn handle_connection<R, W>(
     mut message_rx: mpsc::Receiver<Arc<String>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     notify_tx: mpsc::Sender<NotifyCmd>,
+    tracker_handle: TrackerHandle,
+    bitcoinrpc_config: BitcoinRpcConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send>>
 where
     R: AsyncBufReadExt + Unpin,
@@ -173,7 +181,7 @@ where
                         if line.is_empty() {
                             continue; // Ignore empty lines
                         }
-                        if let Err(e) = process_incoming_message(&line, &mut writer, session, addr, notify_tx.clone()).await {
+                        if let Err(e) = process_incoming_message(&line, &mut writer, session, addr, notify_tx.clone(), tracker_handle.clone(), bitcoinrpc_config.clone()).await {
                             error!("Error processing message from {}: {}", addr, e);
                             return Err(e);
                         }
@@ -199,13 +207,23 @@ async fn process_incoming_message<W>(
     session: &mut Session,
     addr: SocketAddr,
     notify_tx: mpsc::Sender<NotifyCmd>,
+    tracker_handle: TrackerHandle,
+    bitcoinrpc_config: BitcoinRpcConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send>>
 where
     W: AsyncWriteExt + Unpin,
 {
     match serde_json::from_str::<Request>(line) {
         Ok(message) => {
-            let response = handle_message(message, session, addr, notify_tx).await;
+            let response = handle_message(
+                message,
+                session,
+                addr,
+                notify_tx,
+                tracker_handle,
+                bitcoinrpc_config,
+            )
+            .await;
 
             if let Ok(response) = response {
                 // Send the response back to the client
@@ -245,20 +263,16 @@ where
 #[cfg(test)]
 mod stratum_server_tests {
     use super::*;
-    use bitcoindrpc::MockBitcoindRpc;
+    use crate::work::tracker::start_tracker_actor;
+    use bitcoindrpc::test_utils::setup_mock_bitcoin_rpc;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[tokio::test]
     async fn test_create_and_start_server() {
-        let ctx = MockBitcoindRpc::new_context();
-        ctx.expect().returning(|_, _, _| {
-            let mut mock = MockBitcoindRpc::default();
-            mock.expect_getblocktemplate()
-                .returning(|_| Box::pin(async move { Ok("".into()) }));
-            Ok(mock)
-        });
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let connections_handle = ClientConnectionsHandle::default();
+        let tracker_handle = start_tracker_actor();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         let mut server = StratumServer::new(
             "127.0.0.1".to_string(),
@@ -278,7 +292,9 @@ mod stratum_server_tests {
         // Start the server in a separate task so we can shut it down
         let server_handle = tokio::spawn(async move {
             // We'll ignore errors here since we'll forcibly shut down the server
-            let _ = server.start(Some(ready_tx), notify_tx).await;
+            let _ = server
+                .start(Some(ready_tx), notify_tx, tracker_handle, bitcoinrpc_config)
+                .await;
         });
 
         ready_rx.await.expect("Server should signal readiness");
@@ -300,6 +316,7 @@ mod stratum_server_tests {
         let request = Request::new_subscribe(1, "agent".to_string(), "1.0".to_string(), None);
         let input_string = serde_json::to_string(&request).unwrap() + "\n";
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         // Setup reader and writer
         let reader = input_string.as_bytes();
@@ -308,6 +325,7 @@ mod stratum_server_tests {
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
 
         // Run the handler
         let result = handle_connection(
@@ -317,6 +335,8 @@ mod stratum_server_tests {
             message_rx,
             shutdown_rx,
             notify_tx,
+            tracker_handle,
+            bitcoinrpc_config,
         )
         .await;
 
@@ -378,6 +398,8 @@ mod stratum_server_tests {
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         // Run the handler
         let result = handle_connection(
@@ -387,6 +409,8 @@ mod stratum_server_tests {
             message_rx,
             shutdown_rx,
             notify_tx,
+            tracker_handle,
+            bitcoinrpc_config,
         )
         .await;
 
@@ -421,10 +445,21 @@ mod stratum_server_tests {
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         // Run the handler
-        let result =
-            handle_connection(input, &mut writer, addr, message_rx, shutdown_rx, notify_tx).await;
+        let result = handle_connection(
+            input,
+            &mut writer,
+            addr,
+            message_rx,
+            shutdown_rx,
+            notify_tx,
+            tracker_handle,
+            bitcoinrpc_config,
+        )
+        .await;
 
         // Returns an error, so we can close the connection gracefully.
         assert!(
@@ -460,6 +495,8 @@ mod stratum_server_tests {
         let (_, message_rx) = mpsc::channel(10);
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         // Run the handler
         let result = super::handle_connection(
@@ -469,6 +506,8 @@ mod stratum_server_tests {
             message_rx,
             shutdown_rx,
             notify_tx,
+            tracker_handle,
+            bitcoinrpc_config,
         )
         .await;
 
@@ -505,6 +544,7 @@ mod stratum_server_tests {
         // Create message channel and shutdown channel
         let (message_tx, message_rx) = mpsc::channel(10);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         // Create a channel to get the writer result for verification
         let (writer_tx, writer_rx) = oneshot::channel::<Vec<u8>>();
@@ -532,6 +572,7 @@ mod stratum_server_tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8082);
 
         let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
 
         // Spawn the handler in a separate task
         let handle = tokio::spawn(async move {
@@ -544,6 +585,8 @@ mod stratum_server_tests {
                 message_rx,
                 shutdown_rx,
                 notify_tx,
+                tracker_handle,
+                bitcoinrpc_config,
             )
             .await;
 
@@ -601,6 +644,7 @@ mod stratum_server_tests {
         // Create message channel and shutdown channel
         let (message_tx, message_rx) = mpsc::channel(10);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (_mock_rpc_server, bitcoinrpc_config) = setup_mock_bitcoin_rpc().await;
 
         // Create a channel to get the writer result for verification
         let (writer_tx, writer_rx) = oneshot::channel::<Vec<u8>>();
@@ -619,6 +663,7 @@ mod stratum_server_tests {
         let mut writer = Vec::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8082);
         let (notify_tx, _notify_rx) = mpsc::channel(10);
+        let tracker_handle = start_tracker_actor();
 
         // Spawn the handler in a separate task
         let handle = tokio::spawn(async move {
@@ -631,6 +676,8 @@ mod stratum_server_tests {
                 message_rx,
                 shutdown_rx,
                 notify_tx,
+                tracker_handle,
+                bitcoinrpc_config,
             )
             .await;
 
