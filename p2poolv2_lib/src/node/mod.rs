@@ -20,7 +20,6 @@ pub use crate::config::Config;
 pub mod actor;
 pub mod messages;
 pub mod p2p_message_handlers;
-pub mod rate_limiter;
 
 use crate::node::behaviour::request_response::RequestResponseEvent;
 use crate::node::messages::Message;
@@ -43,11 +42,11 @@ use libp2p::{
     swarm::SwarmEvent,
     Multiaddr, Swarm,
 };
-use rate_limiter::RateLimiter;
+use request_response_handler::handle_request_response_event;
 use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tower::Service;
+use tower::{limit::RateLimitLayer, Service, ServiceBuilder};
 use tracing::{debug, error, info, warn};
 
 pub struct SwarmResponseChannel<T> {
@@ -83,7 +82,6 @@ struct Node {
     swarm_tx: mpsc::Sender<SwarmSend<ResponseChannel<Message>>>,
     swarm_rx: mpsc::Receiver<SwarmSend<ResponseChannel<Message>>>,
     chain_handle: ChainHandle,
-    rate_limiter: RateLimiter,
     config: Config,
 }
 
@@ -167,15 +165,11 @@ impl Node {
             return Err(e);
         }
 
-        let rate_limiter =
-            RateLimiter::new(Duration::from_secs(config.network.rate_limit_window_secs));
-
         Ok(Self {
             swarm,
             swarm_tx,
             swarm_rx,
             chain_handle,
-            rate_limiter,
             config: config.clone(),
         })
     }
@@ -356,22 +350,6 @@ impl Node {
                 },
         } = request_response_event
         {
-            let message = request.clone();
-            if !self
-                .rate_limiter
-                .check_rate_limit(&peer, message.clone(), &self.config.network)
-                .await
-            {
-                warn!(
-                    "Rate limit exceeded for peer {} with message type {:?}. Disconnecting.",
-                    peer, message
-                );
-                self.swarm.disconnect_peer_id(peer).unwrap_or_else(|e| {
-                    error!("Failed to disconnect rate-limited peer: {:?}", e);
-                });
-                return Ok(());
-            }
-
             // Create the RequestContext
             let ctx = RequestContext::<ResponseChannel<Message>, _> {
                 peer,
@@ -383,8 +361,9 @@ impl Node {
             };
 
             // Spawn the tower service
+            let swarm_tx = self.swarm_tx.clone();
             tokio::spawn(async move {
-                let mut service = P2PService;
+                let mut service = P2PService::new(swarm_tx);
                 if let Err(e) = service.call(ctx).await {
                     error!("P2PService failed: {}", e);
                 }
