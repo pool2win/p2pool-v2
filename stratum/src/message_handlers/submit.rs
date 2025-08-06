@@ -18,11 +18,14 @@ use crate::difficulty_adjuster::DifficultyAdjusterTrait;
 use crate::error::Error;
 use crate::messages::{Message, Response, SetDifficultyNotification, SimpleRequest};
 use crate::session::Session;
+use crate::share_block::emit_share_block;
 use crate::work::difficulty::validate::validate_submission_difficulty;
 use crate::work::tracker::{JobId, TrackerHandle};
 use bitcoin::blockdata::block::Block;
+use bitcoin::p2p::message_compact_blocks::CmpctBlock;
 use bitcoindrpc::{BitcoinRpcConfig, BitcoindRpcClient};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 /// Handle the "mining.submit" message
@@ -46,6 +49,7 @@ pub async fn handle_submit<'a, D: DifficultyAdjusterTrait>(
     tracker_handle: TrackerHandle,
     bitcoinrpc_config: BitcoinRpcConfig,
     network: bitcoin::Network,
+    shares_tx: mpsc::Sender<CmpctBlock>,
 ) -> Result<Vec<Message<'a>>, Error> {
     debug!("Handling mining.submit message");
     if message.params.len() < 4 {
@@ -85,6 +89,15 @@ pub async fn handle_submit<'a, D: DifficultyAdjusterTrait>(
 
     // Submit block asap, do difficulty adjustment after submission
     submit_block(&block, bitcoinrpc_config).await;
+
+    // Emit the share block to the tx channel
+    if let Err(e) = emit_share_block(&block, session.nonce, session.version_mask, &mut shares_tx) {
+        error!("Failed to emit share block: {}", e);
+        return Ok(vec![Message::Response(Response::new_ok(
+            message.id,
+            json!(false),
+        ))]);
+    }
 
     let (new_difficulty, _is_first_share) = session.difficulty_adjuster.record_share_submission(
         block.header.difficulty(network),

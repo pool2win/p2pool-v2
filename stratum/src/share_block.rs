@@ -14,15 +14,22 @@
 // You should have received a copy of the GNU General Public License along with
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod client_connections;
-pub mod config;
-pub mod difficulty_adjuster;
-pub mod error;
-pub mod message_handlers;
-pub mod messages;
-pub mod server;
-pub mod session;
-pub mod share_block;
-pub mod util;
-pub mod work;
-pub mod zmq_listener;
+use bitcoin::{bip152::HeaderAndShortIds, p2p::message_compact_blocks::CmpctBlock, Block};
+use tokio::sync::mpsc;
+
+/// Send a compact block message to the tx channel
+pub fn emit_share_block(
+    share_block: &Block,
+    nonce: u64,
+    version: u32,
+    tx: &mut mpsc::Sender<CmpctBlock>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let header_and_short_ids: HeaderAndShortIds =
+        HeaderAndShortIds::from_block(share_block, nonce, version, &[0])
+            .map_err(|e| format!("Failed to create HeaderAndShortIds: {e}"))?;
+    let message = CmpctBlock {
+        compact_block: header_and_short_ids,
+    };
+    tx.try_send(message)?;
+    Ok(())
+}
